@@ -57,6 +57,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/NoFolder.h"
 #include "llvm/IR/PassManager.h"
@@ -442,6 +443,38 @@ static bool allCallersPassValidPointerForArgument(Argument *Arg,
   });
 }
 
+/// Return true if the argument may alias with a global variable that is
+/// modified within the function.
+static bool argAliasesModifiedGlobal(Argument *Arg) {
+  Function *F = Arg->getParent();
+
+  SmallPtrSet<const GlobalVariable *, 4> ModifiedGVs;
+  for (Instruction &I : instructions(F))
+    if (auto *SI = dyn_cast<StoreInst>(&I)) {
+      Value *Base = getUnderlyingObject(SI->getPointerOperand());
+      if (auto *GV = dyn_cast<GlobalVariable>(Base))
+        ModifiedGVs.insert(GV);
+    }
+
+  if (ModifiedGVs.empty())
+    return false;
+
+  unsigned ArgNo = Arg->getArgNo();
+  for (User *U : F->users()) {
+    auto *CB = dyn_cast<CallBase>(U);
+    if (!CB)
+      return true;
+
+    Value *Op = CB->getArgOperand(ArgNo);
+    Value *Base = getUnderlyingObject(Op);
+    if (auto *GV = dyn_cast<GlobalVariable>(Base))
+      if (ModifiedGVs.contains(GV))
+        return true;
+  }
+
+  return false;
+}
+
 /// Determine that this argument is safe to promote, and find the argument
 /// parts it can be promoted into.
 static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
@@ -450,6 +483,9 @@ static bool findArgParts(Argument *Arg, const DataLayout &DL, AAResults &AAR,
   // Quick exit for unused arguments
   if (Arg->use_empty())
     return true;
+
+  if (argAliasesModifiedGlobal(Arg))
+    return false;
 
   // We can only promote this argument if all the uses are loads at known
   // offsets.
